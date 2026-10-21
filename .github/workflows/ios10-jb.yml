@@ -306,7 +306,11 @@ jobs:
           xcodebuild -version
 
       - name: Install tools
-        run: brew install cmake ninja ldid dpkg
+        run: |
+          brew install cmake ninja ldid dpkg
+          # UpdateCoreStrings.py runs under /usr/bin/python3 (Xcode's python) and needs polib
+          /usr/bin/python3 -m pip install --user polib
+          /usr/bin/python3 -c "import polib; print('polib', polib.__version__)"
 
       - name: Build (Jailbroken, iOS 10, arm64)
         run: |
