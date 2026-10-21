@@ -298,6 +298,38 @@ jobs:
           sed -i '' 's/_LIBCPP_FUNC_VIS/__attribute__((visibility("default")))/' $D/src/filesystem/int128_builtins.cpp
           # bartycrouch isn't installed on the runner; it only refreshes storyboard strings, so skip it when missing
           sed -i '' 's/^bartycrouch update -x$/if command -v bartycrouch >\/dev\/null 2>\&1; then bartycrouch update -x; else echo "bartycrouch not found, skipping"; fi/' Source/iOS/App/Project/Scripts/UpdateStoryboardStrings.sh
+          # scroll view content/frame layout guides need iOS 11; ibtool rejects them for target 10.0 -> pin constraints to the scroll view itself
+          python3 - <<'PYEOF2'
+          import re, glob, sys
+          root = "Source/iOS/App"
+          tag = re.compile(r'<(/?)(\w+)([^>]*?)(/?)>')
+          n = 0
+          for p in glob.glob(root + "/**/*.xib", recursive=True) + glob.glob(root + "/**/*.storyboard", recursive=True):
+              s = open(p, encoding="utf-8").read()
+              if 'key="contentLayoutGuide"' not in s:
+                  continue
+              stack, remap = [], {}
+              for m in tag.finditer(s):
+                  close, name, attrs, selfc = m.groups()
+                  if name == "viewLayoutGuide":
+                      k = re.search(r'key="(contentLayoutGuide|frameLayoutGuide)"', attrs)
+                      i = re.search(r'\bid="([^"]+)"', attrs)
+                      if k and i:
+                          owner = next((x for x in reversed(stack) if x[0] in ("scrollView", "tableView", "collectionView", "textView")), None)
+                          if owner:
+                              remap[i.group(1)] = owner[1]
+                  if close:
+                      if stack: stack.pop()
+                  elif not selfc:
+                      i = re.search(r'\bid="([^"]+)"', attrs)
+                      stack.append((name, i.group(1) if i else None))
+              s = re.sub(r'[ \t]*<viewLayoutGuide key="(?:contentLayoutGuide|frameLayoutGuide)" id="[^"]+"/>\n', '', s)
+              for old, new in remap.items():
+                  s = re.sub(r'((?:firstItem|secondItem)=")%s(")' % re.escape(old), r'\g<1>%s\2' % new, s)
+              open(p, "w", encoding="utf-8").write(s)
+              print("fixed", p, remap); n += 1
+          print("files", n)
+          PYEOF2
 
       - name: Select Xcode
         run: |
