@@ -15,6 +15,7 @@ jobs:
       # GitHub runners cannot run Xcode 13.4.1 (needs macOS 12), so use the newest Xcode that
       # still accepts old deployment targets. Change if the runner image has a different one.
       XCODE_APP: /Applications/Xcode_15.4.app
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
       BUILD_ARGS: -project Source/iOS/App/DolphiniOS.xcodeproj -derivedDataPath build-Xcode IPHONEOS_DEPLOYMENT_TARGET=10.0 DOL_PBID_ORGANIZATION_IDENTIFIER=me.oatmealdome DOL_BUILD_SOURCE=development CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
 
     steps:
