@@ -279,6 +279,8 @@ jobs:
           for f in src/filesystem/directory_iterator.cpp src/filesystem/filesystem_common.h src/filesystem/int128_builtins.cpp src/filesystem/operations.cpp src/filesystem/posix_compat.h src/include/apple_availability.h LICENSE.TXT; do
             curl -fsSL "$B/$f" -o "$D/$f"
           done
+          # Xcode 15.4 libc++ no longer defines _LIBCPP_FUNC_VIS (LLVM 16 sources still use it)
+          sed -i '' 's/_LIBCPP_FUNC_VIS/__attribute__((visibility("default")))/' $D/src/filesystem/int128_builtins.cpp
 
       - name: Select Xcode
         run: |
