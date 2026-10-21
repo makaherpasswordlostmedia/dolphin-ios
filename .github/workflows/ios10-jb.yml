@@ -353,7 +353,7 @@ jobs:
         run: |
           mkdir products
           P=Source/iOS/App/Project
-            bash $P/Scripts/CreateDebLdid.sh \
+          bash $P/Scripts/CreateDebLdid.sh \
             "build-Xcode/Build/Products/Release (Jailbroken)-iphoneos/DolphiniOS.app" \
             $P/Entitlements/Private.entitlements \
             $P/Package/Deb/control-normal.in \
@@ -361,10 +361,24 @@ jobs:
             $P/Package/Deb/postrm.sh \
             products/DolphiniOS-iOS10.deb
 
+      - name: Package .ipa (ldid fake-sign)
+        run: |
+          APP="build-Xcode/Build/Products/Release (Jailbroken)-iphoneos/DolphiniOS.app"
+          ENT="$PWD/Source/iOS/App/Project/Entitlements/Private.entitlements"
+          T=$(mktemp -d)
+          mkdir "$T/Payload"
+          cp -R "$APP" "$T/Payload/"
+          A="$T/Payload/DolphiniOS.app"
+          for f in "$A"/Frameworks/*.dylib; do [ -e "$f" ] && ldid -S "$f" || true; done
+          ldid -S"$ENT" "$A/$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$A/Info.plist")"
+          (cd "$T" && zip -qry "$GITHUB_WORKSPACE/products/DolphiniOS-iOS10.ipa" Payload)
+          ls -l products
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: dolphinios-ios10
           path: |
             products/*.deb
+            products/*.ipa
             build.log
