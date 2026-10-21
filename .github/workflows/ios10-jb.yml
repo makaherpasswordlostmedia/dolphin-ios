@@ -296,6 +296,8 @@ jobs:
           done
           # Xcode 15.4 libc++ no longer defines _LIBCPP_FUNC_VIS (LLVM 16 sources still use it)
           sed -i '' 's/_LIBCPP_FUNC_VIS/__attribute__((visibility("default")))/' $D/src/filesystem/int128_builtins.cpp
+          # bartycrouch isn't installed on the runner; it only refreshes storyboard strings, so skip it when missing
+          sed -i '' 's/^bartycrouch update -x$/if command -v bartycrouch >\/dev\/null 2>\&1; then bartycrouch update -x; else echo "bartycrouch not found, skipping"; fi/' Source/iOS/App/Project/Scripts/UpdateStoryboardStrings.sh
 
       - name: Select Xcode
         run: |
