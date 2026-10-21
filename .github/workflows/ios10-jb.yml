@@ -349,6 +349,22 @@ jobs:
           set -o pipefail
           xcodebuild -configuration "Release (Jailbroken)" -scheme "DiOS (JB)" $BUILD_ARGS | tee build.log | tail -n 200
 
+      - name: Fix iOS 10 load paths (IOSurface is a PrivateFramework on iOS 10)
+        run: |
+          APP="build-Xcode/Build/Products/Release (Jailbroken)-iphoneos/DolphiniOS.app"
+          OLD=/System/Library/Frameworks/IOSurface.framework/IOSurface
+          NEW=/System/Library/PrivateFrameworks/IOSurface.framework/IOSurface
+          for f in "$APP"/Frameworks/*.dylib "$APP/DolphiniOS"; do
+            if otool -L "$f" | grep -q "$OLD"; then
+              echo "patching $f"
+              install_name_tool -change "$OLD" "$NEW" "$f"
+            fi
+          done
+          echo "== remaining references to IOSurface =="
+          for f in "$APP"/Frameworks/*.dylib "$APP/DolphiniOS"; do otool -L "$f" | grep -H --label="$f" IOSurface || true; done
+          echo "== system frameworks referenced by non-Swift libs =="
+          for f in "$APP/DolphiniOS" "$APP"/Frameworks/libdolphin.dylib "$APP"/Frameworks/libMoltenVK.dylib; do echo "-- $f"; otool -L "$f" | grep -E "/System/Library/(Private)?Frameworks" | awk '{print $1}'; done
+
       - name: Package .deb (ldid fake-sign)
         run: |
           mkdir products
