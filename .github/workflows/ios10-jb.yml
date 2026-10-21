@@ -272,8 +272,8 @@ jobs:
           rkrfwe/idzDrJUoQnGMy5G2sFc6O0Iy++nRXRAlRnPIyWBEYCN7ZC5DSM+/xq/8f0ruREdRNAQA=
           B64
           git apply --whitespace=nowarn ios10_port.patch
-          # clang refuses aligned new/delete on iOS<11; IOS10Compat.cpp provides them, so silence the diagnostic
-          sed -i '' 's/-D_LIBCPP_DISABLE_AVAILABILITY/-D_LIBCPP_DISABLE_AVAILABILITY -Wno-aligned-allocation-unavailable/' Source/iOS/App/Project/Scripts/BuildCore.sh Source/iOS/App/Project/Config/Common.xcconfig CMakeLists.txt
+          # clang errors on aligned new/delete when targeting iOS<11 (not a suppressible warning); disable aligned allocation
+          sed -i '' 's/-D_LIBCPP_DISABLE_AVAILABILITY/-D_LIBCPP_DISABLE_AVAILABILITY -fno-aligned-allocation/' Source/iOS/App/Project/Scripts/BuildCore.sh Source/iOS/App/Project/Config/Common.xcconfig CMakeLists.txt
           # vendored LLVM 16.0.6 libc++ filesystem sources (unmodified; matches Xcode 15.4 libc++)
           B=https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-16.0.6/libcxx
           D=Externals/libcxx-fs-compat
