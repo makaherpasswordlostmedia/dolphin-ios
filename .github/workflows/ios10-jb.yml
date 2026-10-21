@@ -272,11 +272,11 @@ jobs:
           rkrfwe/idzDrJUoQnGMy5G2sFc6O0Iy++nRXRAlRnPIyWBEYCN7ZC5DSM+/xq/8f0ruREdRNAQA=
           B64
           git apply --whitespace=nowarn ios10_port.patch
-          # vendored LLVM 13.0.1 libc++ filesystem sources (unmodified)
-          B=https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-13.0.1/libcxx
+          # vendored LLVM 16.0.6 libc++ filesystem sources (unmodified; matches Xcode 15.4 libc++)
+          B=https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-16.0.6/libcxx
           D=Externals/libcxx-fs-compat
           mkdir -p $D/src/filesystem $D/src/include
-          for f in src/filesystem/directory_iterator.cpp src/filesystem/filesystem_common.h src/filesystem/int128_builtins.cpp src/filesystem/operations.cpp src/filesystem/posix_compat.h src/include/apple_availability.h src/include/atomic_support.h src/include/config_elast.h src/include/refstring.h LICENSE.TXT; do
+          for f in src/filesystem/directory_iterator.cpp src/filesystem/filesystem_common.h src/filesystem/int128_builtins.cpp src/filesystem/operations.cpp src/filesystem/posix_compat.h src/include/apple_availability.h LICENSE.TXT; do
             curl -fsSL "$B/$f" -o "$D/$f"
           done
 
