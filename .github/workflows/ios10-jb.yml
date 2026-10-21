@@ -353,7 +353,7 @@ jobs:
         run: |
           mkdir products
           P=Source/iOS/App/Project
-          $P/Scripts/CreateDebLdid.sh \
+            bash $P/Scripts/CreateDebLdid.sh \
             "build-Xcode/Build/Products/Release (Jailbroken)-iphoneos/DolphiniOS.app" \
             $P/Entitlements/Private.entitlements \
             $P/Package/Deb/control-normal.in \
