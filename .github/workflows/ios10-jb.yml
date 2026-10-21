@@ -274,6 +274,8 @@ jobs:
           git apply --whitespace=nowarn ios10_port.patch
           # clang errors on aligned new/delete when targeting iOS<11 (not a suppressible warning); disable aligned allocation
           sed -i '' 's/-D_LIBCPP_DISABLE_AVAILABILITY/-D_LIBCPP_DISABLE_AVAILABILITY -fno-aligned-allocation/' Source/iOS/App/Project/Scripts/BuildCore.sh Source/iOS/App/Project/Config/Common.xcconfig CMakeLists.txt
+          # homebrew's zstd got picked up via pkg-config (host arch, not iOS) -> force the vendored Externals/zstd
+          sed -i '' 's/pkg_check_modules(ZSTD QUIET libzstd>=1.4.0 IMPORTED_TARGET)/set(ZSTD_FOUND OFF)/' CMakeLists.txt
           # vendored LLVM 16.0.6 libc++ filesystem sources (unmodified; matches Xcode 15.4 libc++)
           B=https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-16.0.6/libcxx
           D=Externals/libcxx-fs-compat
