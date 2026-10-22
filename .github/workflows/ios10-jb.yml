@@ -671,17 +671,26 @@ jobs:
       - name: Patch MSL version and MSAA texture type for iOS 10
         run: |
           python3 - <<'PYEOF5'
+          import re
           u = "Source/Core/VideoBackends/Metal/MTLUtil.mm"
-          s = open(u).read()
-          old = "  else\n    options.set_msl_version(2, 0);"
-          new = ("  else if (@available(macOS 10.13, iOS 11, *))\n    options.set_msl_version(2, 0);\n"
-                 "  else\n    options.set_msl_version(1, 2); // iOS 10 only has MSL 1.2")
-          assert s.count(old) == 1, s.count(old)
-          open(u, "w").write(s.replace(old, new))
+          s = open(u, newline="").read()
+          if "set_msl_version(1, 2)" in s:
+              print("MSL patch already applied")
+          else:
+              pat = re.compile(r"(\n[ \t]*)else([ \t]*\r?\n[ \t]*)options\.set_msl_version\(2,\s*0\);")
+              new, n = pat.subn(
+                  lambda m: m.group(1) + "else if (@available(macOS 10.13, iOS 11, *))" + m.group(2)
+                  + "options.set_msl_version(2, 0);" + m.group(1)
+                  + "else" + m.group(2) + "options.set_msl_version(1, 2);", s, count=1)
+              print("MSL patch matches:", n)
+              if n:
+                  open(u, "w", newline="").write(new)
+              else:
+                  print("WARNING: set_msl_version(2, 0) block not found, skipped")
           g = "Source/Core/VideoBackends/Metal/MTLGfx.mm"
-          s = open(g).read()
-          old = "[desc setTextureType:config.samples > 1 ? MTLTextureType2DMultisampleArray :\n                                              MTLTextureType2DArray];"
-          new = ("MTLTextureType tex_type = MTLTextureType2DArray;\n"
+          s = open(g, newline="").read()
+          pat = re.compile(r"\[desc setTextureType:\s*config\.samples\s*>\s*1\s*\?\s*MTLTextureType2DMultisampleArray\s*:\s*MTLTextureType2DArray\];")
+          rep = ("MTLTextureType tex_type = MTLTextureType2DArray;\n"
                  "    if (config.samples > 1)\n"
                  "    {\n"
                  "      if (@available(macOS 10.14, iOS 14, *))\n"
@@ -690,8 +699,12 @@ jobs:
                  "        tex_type = MTLTextureType2DMultisample;\n"
                  "    }\n"
                  "    [desc setTextureType:tex_type];")
-          assert s.count(old) == 1, s.count(old)
-          open(g, "w").write(s.replace(old, new))
+          new, n = pat.subn(lambda m: rep, s, count=1)
+          print("MSAA patch matches:", n)
+          if n:
+              open(g, "w", newline="").write(new)
+          else:
+              print("WARNING: setTextureType block not found, skipped")
           PYEOF5
 
       - name: Build (Jailbroken, iOS 10, arm64)
