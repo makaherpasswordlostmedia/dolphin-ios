@@ -355,7 +355,7 @@ jobs:
           echo "imagesets generated: $(ls -d $X/*.imageset | wc -l)"
           test -d $X/gcpad_a.imageset && test -f $X/gcpad_a.imageset/gcpad_a@2x.png
 
-      - name: Patch touch-controller image loading (no force-unwrap, loose PNG fallback)
+      - name: Patch touch-controller images (no force-unwrap) and Metal displaySyncEnabled for iOS 10
         run: |
           python3 - <<'PYEOF4'
           d = "Source/iOS/App/DolphiniOS/UI/Emulation/TouchController/"
@@ -409,6 +409,13 @@ jobs:
               ("let image = UIImage(named: imageName, in: Bundle(for: type(of: self)), compatibleWith: nil)\n",
                "let image = UIImage.dolphinBundleImage(named: imageName, in: Bundle(for: type(of: self)))\n"),
           ])
+          # CAMetalLayer.displaySyncEnabled is not available on iOS (unrecognized selector -> abort on the emulation thread at game start)
+          g = "Source/Core/VideoBackends/Metal/MTLGfx.mm"
+          s = open(g).read()
+          a = "[m_layer setDisplaySyncEnabled:g_ActiveConfig.bVSyncActive];"
+          assert s.count(a) == 2, s.count(a)
+          s = s.replace(a, "if ([m_layer respondsToSelector:@selector(setDisplaySyncEnabled:)]) " + a)
+          open(g, "w").write(s)
           PYEOF4
 
       - name: Build (Jailbroken, iOS 10, arm64)
