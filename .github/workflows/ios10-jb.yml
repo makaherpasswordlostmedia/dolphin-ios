@@ -416,6 +416,24 @@ jobs:
           assert s.count(a) == 2, s.count(a)
           s = s.replace(a, "if ([m_layer respondsToSelector:@selector(setDisplaySyncEnabled:)]) " + a)
           open(g, "w").write(s)
+          # MTLRenderPipelineDescriptor.rasterSampleCount is iOS 12+ (sampleCount is the iOS 8+ name); inputPrimitiveTopology is iOS 12+;
+          # MTLRenderCommandEncoder.setDepthClipMode: is iOS 11+. Unrecognized selectors abort the emulation thread.
+          m = "Source/Core/VideoBackends/Metal/"
+          def patch_metal(name, pairs):
+              s = open(m + name).read()
+              for old, new in pairs:
+                  assert s.count(old) == 1, (name, old, s.count(old))
+                  s = s.replace(old, new)
+              open(m + name, "w").write(s)
+          patch_metal("MTLObjectCache.mm", [
+              ("[desc setRasterSampleCount:fs.samples];", "[desc setSampleCount:fs.samples];"),
+              ("[desc setInputPrimitiveTopology:GetClass(rs.primitive)];",
+               "if ([desc respondsToSelector:@selector(setInputPrimitiveTopology:)]) [desc setInputPrimitiveTopology:GetClass(rs.primitive)];"),
+          ])
+          patch_metal("MTLStateTracker.mm", [
+              ("[enc setDepthClipMode:clip];",
+               "if ([enc respondsToSelector:@selector(setDepthClipMode:)]) [enc setDepthClipMode:clip];"),
+          ])
           PYEOF4
 
       - name: Build (Jailbroken, iOS 10, arm64)
