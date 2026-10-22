@@ -668,10 +668,46 @@ jobs:
 
           PYEOF4
 
+      - name: Patch MSL version and MSAA texture type for iOS 10
+        run: |
+          python3 - <<'PYEOF5'
+          u = "Source/Core/VideoBackends/Metal/MTLUtil.mm"
+          s = open(u).read()
+          old = "  else\n    options.set_msl_version(2, 0);"
+          new = ("  else if (@available(macOS 10.13, iOS 11, *))\n    options.set_msl_version(2, 0);\n"
+                 "  else\n    options.set_msl_version(1, 2); // iOS 10 only has MSL 1.2")
+          assert s.count(old) == 1, s.count(old)
+          open(u, "w").write(s.replace(old, new))
+          g = "Source/Core/VideoBackends/Metal/MTLGfx.mm"
+          s = open(g).read()
+          old = "[desc setTextureType:config.samples > 1 ? MTLTextureType2DMultisampleArray :\n                                              MTLTextureType2DArray];"
+          new = ("MTLTextureType tex_type = MTLTextureType2DArray;\n"
+                 "    if (config.samples > 1)\n"
+                 "    {\n"
+                 "      if (@available(macOS 10.14, iOS 14, *))\n"
+                 "        tex_type = MTLTextureType2DMultisampleArray;\n"
+                 "      else\n"
+                 "        tex_type = MTLTextureType2DMultisample;\n"
+                 "    }\n"
+                 "    [desc setTextureType:tex_type];")
+          assert s.count(old) == 1, s.count(old)
+          open(g, "w").write(s.replace(old, new))
+          PYEOF5
+
       - name: Build (Jailbroken, iOS 10, arm64)
         run: |
           set -o pipefail
           xcodebuild -configuration "Release (Jailbroken)" -scheme "DiOS (JB)" $BUILD_ARGS | tee build.log | tail -n 200
+
+      - name: Dump libdolphin symbols (to resolve crash addresses)
+        if: always()
+        run: |
+          L="build-Xcode/Build/Products/Release (Jailbroken)-iphoneos/DolphiniOS.app/Frameworks/libdolphin.dylib"
+          if [ -f "$L" ]; then
+            mkdir -p products
+            xcrun nm -n -arch arm64 "$L" | xcrun c++filt > products/libdolphin-symbols.txt || true
+            cp "$L" products/libdolphin.dylib || true
+          fi
 
       - name: Bundle touch-controller PNGs as loose files (iOS 10 cannot read the Xcode 15 Assets.car)
         run: |
@@ -798,4 +834,6 @@ jobs:
             products/*.deb
             products/*.ipa
             products/weakened-symbols.txt
+            products/libdolphin-symbols.txt
+            products/libdolphin.dylib
             build.log
