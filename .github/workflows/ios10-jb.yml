@@ -434,6 +434,238 @@ jobs:
               ("[enc setDepthClipMode:clip];",
                "if ([enc respondsToSelector:@selector(setDepthClipMode:)]) [enc setDepthClipMode:clip];"),
           ])
+          # Single-component 8/16-bit MTLVertexFormats (UChar, Short, UCharNormalized, ...) are iOS 11+. The posmtx attribute uses MTLVertexFormatUChar,
+          # so on iOS 10 Metal aborts inside setFormat: on the video thread. Use the 2-component variant there (the shader attribute stays scalar).
+          import re
+          vf = m + "MTLVertexFormat.mm"
+          s = open(vf).read()
+          s, n = re.subn(r"case 1: return MTLVertexFormat((?:UChar|Char|UShort|Short)(?:Normalized)?);",
+                         lambda mo: "case 1: return MTLVertexFormatCompat(MTLVertexFormat%s, MTLVertexFormat%s);" % (
+                             mo.group(1), mo.group(1).replace("Normalized", "") + "2" + ("Normalized" if "Normalized" in mo.group(1) else "")), s)
+          assert n == 8, n
+          helper = """
+          static inline MTLVertexFormat MTLVertexFormatCompat(MTLVertexFormat modern, MTLVertexFormat legacy)
+          {
+            if (@available(iOS 11, macOS 10.13, *))
+              return modern;
+            return legacy;
+          }
+          """
+          inc = '#include "VideoCommon/VertexShaderGen.h"\n'
+          assert s.count(inc) == 1
+          s = s.replace(inc, inc + helper)
+          open(vf, "w").write(s)
+          # On-device diagnostics: log file in the app's Documents folder + crash/exception handlers that write symbolizable backtraces
+          diag = r'''
+          #include <dlfcn.h>
+          #include <stdlib.h>
+          #include <execinfo.h>
+          #include <fcntl.h>
+          #include <pthread.h>
+          #include <signal.h>
+          #include <stdarg.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include <sys/stat.h>
+          #include <sys/types.h>
+          #include <sys/utsname.h>
+          #include <time.h>
+          #include <unistd.h>
+          #if defined(__APPLE__)
+          #include <mach-o/dyld.h>
+          #endif
+
+          // ---- DolphiniOS diagnostics: writes <app container>/Documents/DolphiniOS-debug.log (previous run: ...-debug.previous.log) ----
+          static int s_dol_log_fd = -1;
+
+          static void DOLLogf(const char* fmt, ...)
+          {
+            if (s_dol_log_fd < 0)
+              return;
+
+            char buf[1024];
+            va_list args;
+            va_start(args, fmt);
+            int n = vsnprintf(buf, sizeof(buf), fmt, args);
+            va_end(args);
+
+            if (n <= 0)
+              return;
+            if (n > (int)sizeof(buf) - 1)
+              n = (int)sizeof(buf) - 1;
+
+            ssize_t r = write(s_dol_log_fd, buf, (size_t)n);
+            (void)r;
+          }
+
+          // Prints "image + offset". For libdolphin.dylib the offset equals the file address; for the main executable add 0x100000000.
+          static void DOLLogFrame(unsigned idx, void* addr)
+          {
+            Dl_info info;
+            if (dladdr(addr, &info) && info.dli_fname)
+            {
+              const char* base = strrchr(info.dli_fname, '/');
+              base = base ? base + 1 : info.dli_fname;
+              DOLLogf("  #%02u %p  %s + 0x%lx", idx, addr, base, (unsigned long)((uintptr_t)addr - (uintptr_t)info.dli_fbase));
+              if (info.dli_sname && info.dli_saddr)
+                DOLLogf("  (%s + 0x%lx)", info.dli_sname, (unsigned long)((uintptr_t)addr - (uintptr_t)info.dli_saddr));
+              DOLLogf("\n");
+            }
+            else
+            {
+              DOLLogf("  #%02u %p\n", idx, addr);
+            }
+          }
+
+          static void DOLLogBacktrace(const char* title)
+          {
+            void* frames[64];
+            int n = backtrace(frames, 64);
+            DOLLogf("%s\n", title);
+            for (int i = 0; i < n; i++)
+              DOLLogFrame((unsigned)i, frames[i]);
+          }
+
+          static void DOLSignalHandler(int sig, siginfo_t* info, void* context)
+          {
+            char tname[64] = "";
+            pthread_getname_np(pthread_self(), tname, sizeof(tname));
+
+            DOLLogf("\n==== CRASH: signal %d code=%d fault_addr=%p thread=\"%s\" ====\n", sig, info ? info->si_code : 0,
+                    info ? info->si_addr : NULL, tname);
+
+          (void)context;
+
+            DOLLogBacktrace("Backtrace of crashing thread:");
+            DOLLogf("==== END OF CRASH ====\n");
+
+            // Restore the default action so the system still produces its crash report
+            signal(sig, SIG_DFL);
+          }
+
+          static void DOLInstallSignalHandlers(void)
+          {
+            const int signals[] = {SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE};
+            for (size_t i = 0; i < sizeof(signals) / sizeof(signals[0]); i++)
+            {
+              struct sigaction sa;
+              memset(&sa, 0, sizeof(sa));
+              sa.sa_sigaction = DOLSignalHandler;
+              sa.sa_flags = SA_SIGINFO;
+              sigemptyset(&sa.sa_mask);
+              sigaction(signals[i], &sa, NULL);
+            }
+          }
+
+          static int DOLTryOpenLogIn(const char* dir)
+          {
+            // Create the folder if needed (single level; parents normally exist)
+            mkdir(dir, 0755);
+
+            char path[1100];
+            char prev[1100];
+            snprintf(path, sizeof(path), "%s/DolphiniOS-debug.log", dir);
+            snprintf(prev, sizeof(prev), "%s/DolphiniOS-debug.previous.log", dir);
+
+            rename(path, prev);
+
+            int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
+            if (fd < 0)
+              return -1;
+
+            s_dol_log_fd = fd;
+            return fd;
+          }
+
+          // Returns 1 when the log file was opened. The jailbroken build keeps its user folder in /var/mobile/Documents/DolphiniOS
+          // (not inside the app container), so try that first, then the container's Documents and tmp folders.
+          static int DOLOpenLog(void)
+          {
+            const char* home = getenv("HOME");
+            char dirs[3][1024];
+            int count = 0;
+            snprintf(dirs[count++], sizeof(dirs[0]), "/private/var/mobile/Documents/DolphiniOS");
+            if (home)
+            {
+              snprintf(dirs[count++], sizeof(dirs[0]), "%s/Documents", home);
+              snprintf(dirs[count++], sizeof(dirs[0]), "%s/tmp", home);
+            }
+
+            int fd = -1;
+            for (int i = 0; i < count && fd < 0; i++)
+              fd = DOLTryOpenLogIn(dirs[i]);
+
+            if (fd < 0)
+              return 0;
+
+            // Capture NSLog / printf / fprintf(stderr) output of the whole process
+            dup2(fd, STDERR_FILENO);
+            dup2(fd, STDOUT_FILENO);
+            setvbuf(stdout, NULL, _IONBF, 0);
+
+          time_t now = time(NULL);
+            struct utsname un;
+            uname(&un);
+            DOLLogf("==== DolphiniOS debug log, started %s", ctime(&now));
+            DOLLogf("device=%s kernel=%s pid=%d\n", un.machine, un.release, (int)getpid());
+            return 1;
+          }
+
+          static NSUncaughtExceptionHandler* s_dol_previous_exception_handler = NULL;
+
+          static void DOLUncaughtExceptionHandler(NSException* exception)
+          {
+            DOLLogf("\n==== UNCAUGHT Objective-C EXCEPTION ====\nname: %s\nreason: %s\n", [[exception name] UTF8String],
+                    [[exception reason] UTF8String]);
+
+            NSArray<NSNumber*>* addresses = [exception callStackReturnAddresses];
+            for (NSUInteger i = 0; i < [addresses count]; i++)
+              DOLLogFrame((unsigned)i, (void*)(uintptr_t)[addresses[i] unsignedLongLongValue]);
+
+            DOLLogf("Symbols:\n");
+            for (NSString* symbol in [exception callStackSymbols])
+              DOLLogf("  %s\n", [symbol UTF8String]);
+
+            DOLLogf("==== END OF EXCEPTION ====\n");
+
+            if (s_dol_previous_exception_handler)
+              s_dol_previous_exception_handler(exception);
+          }
+
+          static void DOLInstallDiagnostics(void)
+          {
+            if (!DOLOpenLog())
+              return;
+
+            NSLog(@"DolphiniOS diagnostics: iOS %@, model %@, app %@ (%@)", [[UIDevice currentDevice] systemVersion],
+                  [[UIDevice currentDevice] model],
+                  [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"],
+                  [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"]);
+
+            uint32_t image_count = _dyld_image_count();
+            for (uint32_t i = 0; i < image_count; i++)
+            {
+              const char* name = _dyld_get_image_name(i);
+              if (name && strstr(name, ".app/"))
+                DOLLogf("image %u slide=0x%lx %s\n", i, (unsigned long)_dyld_get_image_vmaddr_slide(i), name);
+            }
+
+            s_dol_previous_exception_handler = NSGetUncaughtExceptionHandler();
+            NSSetUncaughtExceptionHandler(&DOLUncaughtExceptionHandler);
+            DOLInstallSignalHandlers();
+          }
+
+          '''
+          mp = "Source/iOS/App/Common/main.m"
+          s = open(mp).read()
+          imp = '#import "Swift.h"\n'
+          call = "  return UIApplicationMain(argc, argv, nil, appDelegateClassName);"
+          assert s.count(imp) == 1 and s.count(call) == 1
+          s = s.replace(imp, imp + diag)
+          s = s.replace(call, "  DOLInstallDiagnostics();\n\n" + call)
+          open(mp, "w").write(s)
+
           PYEOF4
 
       - name: Build (Jailbroken, iOS 10, arm64)
