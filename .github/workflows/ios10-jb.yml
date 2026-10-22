@@ -360,6 +360,52 @@ jobs:
               install_name_tool -change "$OLD" "$NEW" "$f"
             fi
           done
+          # MoltenVK is built for iOS 11: make Metal classes missing on iOS 10 weak imports (nil instead of dyld abort)
+          cat > "$RUNNER_TEMP/weakbind.py" <<'PYEOF3'
+          import struct, sys
+          path = sys.argv[1]
+          names = set(a.encode() for a in sys.argv[2:])
+          d = bytearray(open(path, "rb").read())
+          magic, = struct.unpack_from("<I", d, 0)
+          assert magic == 0xfeedfacf, "need a thin arm64 Mach-O"
+          ncmds, = struct.unpack_from("<I", d, 16)
+          off = 32
+          info = None
+          for _ in range(ncmds):
+              cmd, size = struct.unpack_from("<II", d, off)
+              if cmd in (0x22, 0x80000022):  # LC_DYLD_INFO(_ONLY)
+                  info = struct.unpack_from("<10I", d, off + 8)
+              off += size
+          assert info, "no LC_DYLD_INFO"
+          rebase_off, rebase_size, bind_off, bind_size, weak_off, weak_size, lazy_off, lazy_size, exp_off, exp_size = info
+          def uleb(i):
+              r = s = 0
+              while True:
+                  b = d[i]; i += 1; r |= (b & 0x7f) << s; s += 7
+                  if not b & 0x80: return r, i
+          def sleb(i):
+              while d[i] & 0x80: i += 1
+              return i + 1
+          patched = {}
+          for start, size in ((bind_off, bind_size), (lazy_off, lazy_size)):
+              i, end = start, start + size
+              while i < end:
+                  op = d[i]; hi, imm = op & 0xf0, op & 0x0f
+                  i += 1
+                  if hi == 0x40:
+                      j = d.index(0, i); name = bytes(d[i:j])
+                      if name in names and not imm & 1:
+                          d[i - 1] = op | 1
+                          patched[name] = patched.get(name, 0) + 1
+                      i = j + 1
+                  elif hi in (0x20, 0x70, 0x80, 0xA0): _, i = uleb(i)
+                  elif hi == 0x60: i = sleb(i)
+                  elif hi == 0xC0: _, i = uleb(i); _, i = uleb(i)
+          open(path, "wb").write(d)
+          for n in names: print(("weakened" if n in patched else "not found/already weak"), n.decode(), patched.get(n, ""))
+          PYEOF3
+          python3 "$RUNNER_TEMP/weakbind.py" "$APP/Frameworks/libMoltenVK.dylib" '_OBJC_CLASS_$_MTLArgumentDescriptor' '_OBJC_CLASS_$_MTLCaptureManager'
+          otool -L "$APP/Frameworks/libMoltenVK.dylib" | head -3
           echo "== remaining references to IOSurface =="
           for f in "$APP"/Frameworks/*.dylib "$APP/DolphiniOS"; do otool -L "$f" | grep -H --label="$f" IOSurface || true; done
           echo "== system frameworks referenced by non-Swift libs =="
