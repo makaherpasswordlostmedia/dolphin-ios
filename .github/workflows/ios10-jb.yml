@@ -355,10 +355,79 @@ jobs:
           echo "imagesets generated: $(ls -d $X/*.imageset | wc -l)"
           test -d $X/gcpad_a.imageset && test -f $X/gcpad_a.imageset/gcpad_a@2x.png
 
+      - name: Patch touch-controller image loading (no force-unwrap, loose PNG fallback)
+        run: |
+          python3 - <<'PYEOF4'
+          d = "Source/iOS/App/DolphiniOS/UI/Emulation/TouchController/"
+          def patch(name, pairs, append=""):
+              s = open(d + name).read()
+              for old, new in pairs:
+                  assert old in s, (name, old)
+                  s = s.replace(old, new)
+              open(d + name, "w").write(s + append)
+          ext = """
+          extension UIImage
+          {
+            // Asset catalogs built by a newer Xcode can be unreadable on old iOS (UIImage(named:) returns nil),
+            // so fall back to loose name@Nx.png files in the bundle.
+            static func dolphinBundleImage(named name: String, in bundle: Bundle) -> UIImage?
+            {
+              if let image = UIImage(named: name, in: bundle, compatibleWith: nil)
+              {
+                return image
+              }
+              
+              let screenScale = Int(UIScreen.main.scale.rounded())
+              
+              for scale in [screenScale, 3, 2, 1]
+              {
+                guard let path = bundle.path(forResource: "\\(name)@\\(scale)x", ofType: "png"),
+                      let image = UIImage(contentsOfFile: path),
+                      let cgImage = image.cgImage else
+                {
+                  continue
+                }
+                
+                return UIImage(cgImage: cgImage, scale: CGFloat(scale), orientation: .up)
+              }
+              
+              return nil
+            }
+          }
+          """
+          patch("TCButton.swift", [
+              ("let image = UIImage(named: named, in: Bundle(for: type(of: self)), compatibleWith: nil)!",
+               "guard let image = UIImage.dolphinBundleImage(named: named, in: Bundle(for: type(of: self))) else { return UIImage() }"),
+              ("let newImage = UIGraphicsGetImageFromCurrentImageContext()!",
+               "let newImage = UIGraphicsGetImageFromCurrentImageContext() ?? image"),
+          ], ext)
+          patch("TCDirectionalPad.swift", [
+              ("return UIImage(named: imageName, in: Bundle(for: type(of: self)), compatibleWith: nil)!",
+               "return UIImage.dolphinBundleImage(named: imageName, in: Bundle(for: type(of: self))) ?? UIImage()"),
+          ])
+          patch("TCJoystick.swift", [
+              ("let image = UIImage(named: imageName, in: Bundle(for: type(of: self)), compatibleWith: nil)\n",
+               "let image = UIImage.dolphinBundleImage(named: imageName, in: Bundle(for: type(of: self)))\n"),
+          ])
+          PYEOF4
+
       - name: Build (Jailbroken, iOS 10, arm64)
         run: |
           set -o pipefail
           xcodebuild -configuration "Release (Jailbroken)" -scheme "DiOS (JB)" $BUILD_ARGS | tee build.log | tail -n 200
+
+      - name: Bundle touch-controller PNGs as loose files (iOS 10 cannot read the Xcode 15 Assets.car)
+        run: |
+          APP="build-Xcode/Build/Products/Release (Jailbroken)-iphoneos/DolphiniOS.app"
+          X=Source/iOS/App/Common/DolphinAssets.xcassets
+          n=0
+          for set in "$X"/*.imageset; do
+            for png in "$set"/*.png; do
+              cp "$png" "$APP/$(basename "$png")"; n=$((n+1))
+            done
+          done
+          echo "copied $n loose PNGs into the app bundle"
+          test -f "$APP/gcpad_a@2x.png"
 
       - name: Check touch-controller images are in the app
         run: |
