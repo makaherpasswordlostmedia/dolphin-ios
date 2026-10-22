@@ -344,10 +344,28 @@ jobs:
           /usr/bin/python3 -m pip install --user polib
           /usr/bin/python3 -c "import polib; print('polib', polib.__version__)"
 
+      - name: Generate touch-controller image assets
+        run: |
+          # The "Copy Dolphin Assets" build phase did not populate DolphinAssets.xcassets in time on CI (Assets.car had no gcpad_*/wiimote_* images,
+          # TCButton.updateImage force-unwraps them -> SIGTRAP when a game starts). Generate them before xcodebuild instead.
+          R=Source/Android/app/src/main/res
+          echo "android drawables: $(ls $R/drawable-hdpi | wc -l) hdpi / $(ls $R/drawable-xhdpi | wc -l) xhdpi / $(ls $R/drawable-xxhdpi | wc -l) xxhdpi"
+          PROJECT_DIR="$PWD/Source/iOS/App" bash Source/iOS/App/Project/Scripts/CopyAssets.sh
+          X=Source/iOS/App/Common/DolphinAssets.xcassets
+          echo "imagesets generated: $(ls -d $X/*.imageset | wc -l)"
+          test -d $X/gcpad_a.imageset && test -f $X/gcpad_a.imageset/gcpad_a@2x.png
+
       - name: Build (Jailbroken, iOS 10, arm64)
         run: |
           set -o pipefail
           xcodebuild -configuration "Release (Jailbroken)" -scheme "DiOS (JB)" $BUILD_ARGS | tee build.log | tail -n 200
+
+      - name: Check touch-controller images are in the app
+        run: |
+          APP="build-Xcode/Build/Products/Release (Jailbroken)-iphoneos/DolphiniOS.app"
+          ls -l "$APP/Assets.car"
+          strings -a "$APP/Assets.car" | grep -c -E "gcpad_a|wiimote" || true
+          strings -a "$APP/Assets.car" | grep -q "gcpad_a" || { echo "::error::gcpad_a missing from Assets.car"; exit 1; }
 
       - name: Fix iOS 10 load paths (IOSurface is a PrivateFramework on iOS 10)
         run: |
