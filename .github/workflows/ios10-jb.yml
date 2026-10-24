@@ -1117,7 +1117,7 @@ jobs:
           patch("MTLStateTracker.mm", [
               ("void Metal::StateTracker::Draw(u32 base_vertex, u32 num_vertices)\n",
                "static bool DOLSupportsBaseVertex()  // DOL-BASEV\n{\n#if TARGET_OS_OSX\n  return true;\n#else\n"
-               "  static const bool supported = [g_device supportsFeatureSet:MTLFeatureSet_iOS_GPUFamily3_v1];\n  return supported;\n#endif\n}\n\n"
+               "  static const bool supported = [Metal::g_device supportsFeatureSet:MTLFeatureSet_iOS_GPUFamily3_v1];\n  return supported;\n#endif\n}\n\n"
                "void Metal::StateTracker::Draw(u32 base_vertex, u32 num_vertices)\n"),
               ("  PrepareRender();\n  [m_current_render_encoder drawPrimitives:m_state.render_pipeline->Prim()\n",
                "  PrepareRender();\n  if (!DOLSupportsBaseVertex() && m_state.vertices && m_state.render_pipeline->UsesVertexBuffer(0))\n"
