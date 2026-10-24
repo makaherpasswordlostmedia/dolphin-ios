@@ -1062,23 +1062,19 @@ jobs:
               print("spirv_cross_error_handling.hpp patched")
           PYEOF7
 
-      - name: iOS 10 - MSL 1.2 and no MSL 2.0-only features
+      - name: iOS 10 - disable features that need MSL 2.0
         run: |
           python3 - <<'PYEOF8'
           f = "Source/Core/VideoBackends/Metal/MTLUtil.mm"
           s = open(f, newline="").read()
-          if "DOL-MSL12" in s:
+          if "DOL-IOS10FLAGS" in s:
               print("already patched")
           else:
-              # iOS 10 only has MSL 1.2; asking SPIRV-Cross for 2.0 produces code the device cannot compile (and can abort inside SPIRV-Cross)
-              a = "  else\n    options.set_msl_version(2, 0);\n"
-              assert s.count(a) == 1, "msl version anchor"
-              s = s.replace(a, "  else if (@available(macOS 10.13, iOS 11, *))\n    options.set_msl_version(2, 0);\n"
-                               "  else\n    options.set_msl_version(1, 2);  // DOL-MSL12\n")
-              # compute texture decoding, dynamic vertex loader and VS line/point expand need 8/16-bit storage + MSL 2.0
+              # The MSL 1.2 version switch is done by the 'Patch MSL version' step; here only the feature flags.
               b = "  if (DriverDetails::HasBug(DriverDetails::BUG_BROKEN_DYNAMIC_SAMPLER_INDEXING))\n    config->backend_info.bSupportsDynamicSamplerIndexing = false;\n"
               assert s.count(b) == 1, "sampler indexing anchor"
               flags = ("#if !TARGET_OS_OSX\n"
+                       "  // DOL-IOS10FLAGS\n"
                        "  if (@available(iOS 11, *))\n  {\n  }\n  else\n  {\n"
                        "    config->backend_info.bSupportsGPUTextureDecoding = false;\n"
                        "    config->backend_info.bSupportsDynamicVertexLoader = false;\n"
@@ -1086,7 +1082,7 @@ jobs:
                        "  }\n#endif\n")
               s = s.replace(b, flags + b)
               open(f, "w", newline="").write(s)
-              print("MTLUtil.mm patched for iOS 10")
+              print("MTLUtil.mm iOS 10 flags patched")
           PYEOF8
 
       - name: A7 - no base-vertex draws, no multisample array textures
