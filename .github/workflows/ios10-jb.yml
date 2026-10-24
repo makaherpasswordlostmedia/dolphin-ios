@@ -471,6 +471,11 @@ jobs:
           #include <sys/types.h>
           #include <sys/utsname.h>
           #include <time.h>
+          #include <sys/ucontext.h>
+          #include <mach/mach.h>
+          #include <mach/vm_map.h>
+          #include <mach-o/getsect.h>
+          #include <mach-o/loader.h>
           #include <unistd.h>
           #if defined(__APPLE__)
           #include <mach-o/dyld.h>
@@ -527,18 +532,210 @@ jobs:
               DOLLogFrame((unsigned)i, frames[i]);
           }
 
+          static const char* DOLSignalName(int sig)
+          {
+            switch (sig)
+            {
+            case SIGABRT: return "SIGABRT";
+            case SIGSEGV: return "SIGSEGV";
+            case SIGBUS: return "SIGBUS";
+            case SIGILL: return "SIGILL";
+            case SIGTRAP: return "SIGTRAP";
+            case SIGFPE: return "SIGFPE";
+            default: return "SIG?";
+            }
+          }
+
+          // Copies memory out of the process without risking a second fault (returns 0 when the range is unreadable).
+          static int DOLSafeRead(uintptr_t addr, void* out, size_t len)
+          {
+            vm_size_t got = 0;
+            kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)addr, (vm_size_t)len, (vm_address_t)out, &got);
+            return kr == KERN_SUCCESS && got == len;
+          }
+
+          static void DOLLogCString(const char* label, uint64_t addr)
+          {
+            if (!addr)
+              return;
+
+            char buf[512];
+            size_t room = 4096 - (size_t)(addr & 4095);  // stay inside one 4K block so the read cannot cross into unmapped memory
+            size_t len = room < sizeof(buf) - 1 ? room : sizeof(buf) - 1;
+            if (!DOLSafeRead((uintptr_t)addr, buf, len))
+              return;
+
+            buf[len] = 0;
+            DOLLogf("    %s: %s\n", label, buf);
+          }
+
+          static double DOLResidentMB(void)
+          {
+            struct mach_task_basic_info info;
+            mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+            if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &count) != KERN_SUCCESS)
+              return -1.0;
+            return (double)info.resident_size / (1024.0 * 1024.0);
+          }
+
+          // Layout of the __DATA,__crash_info section that every system image has. abort(), __assert_rtn, abort_with_reason and
+          // a number of frameworks leave their message here, and it is what iOS shows as "Application Specific Information".
+          struct DOLCrashInfo
+          {
+            uint64_t version;
+            uint64_t message;
+            uint64_t signature_string;
+            uint64_t backtrace;
+            uint64_t message2;
+            uint64_t thread;
+            uint64_t dialog_mode;
+            uint64_t abort_cause;
+          };
+
+          static void DOLLogCrashInfoMessages(void)
+          {
+            DOLLogf("Crash-info messages left by system libraries (assertion / abort text):\n");
+
+            int found = 0;
+            uint32_t count = _dyld_image_count();
+            for (uint32_t i = 0; i < count; i++)
+            {
+              const struct mach_header_64* mh = (const struct mach_header_64*)_dyld_get_image_header(i);
+              if (!mh || mh->magic != MH_MAGIC_64)
+                continue;
+
+              unsigned long size = 0;
+              uint8_t* section = getsectiondata(mh, "__DATA", "__crash_info", &size);
+              if (!section || size < 16)
+                continue;
+
+              struct DOLCrashInfo ci;
+              memset(&ci, 0, sizeof(ci));
+              memcpy(&ci, section, size < sizeof(ci) ? size : sizeof(ci));
+              if (!ci.message && !ci.message2 && !ci.signature_string)
+                continue;
+
+              const char* name = _dyld_get_image_name(i);
+              const char* base = name ? strrchr(name, '/') : NULL;
+              DOLLogf("  [%s]\n", base ? base + 1 : (name ? name : "?"));
+              DOLLogCString("message", ci.message);
+              DOLLogCString("message2", ci.message2);
+              DOLLogCString("signature", ci.signature_string);
+              found++;
+            }
+
+            if (!found)
+              DOLLogf("  (none; if the message was sent through os_log it only shows up when OS_ACTIVITY_DT_MODE took effect)\n");
+          }
+
+          static void DOLLogImageUUID(uint32_t i)
+          {
+            const struct mach_header_64* mh = (const struct mach_header_64*)_dyld_get_image_header(i);
+            if (!mh || mh->magic != MH_MAGIC_64)
+              return;
+
+            const struct load_command* lc = (const struct load_command*)(mh + 1);
+            for (uint32_t c = 0; c < mh->ncmds; c++)
+            {
+              if (lc->cmd == LC_UUID)
+              {
+                const struct uuid_command* u = (const struct uuid_command*)lc;
+                char hex[40];
+                for (int k = 0; k < 16; k++)
+                  snprintf(hex + k * 2, 3, "%02x", u->uuid[k]);
+                DOLLogf("  uuid=%s\n", hex);
+                return;
+              }
+              lc = (const struct load_command*)((const char*)lc + lc->cmdsize);
+            }
+          }
+
+          // Walks the frame-pointer chain starting at the interrupted context. This reaches through system frameworks
+          // (Metal, ...) where backtrace() from inside the signal handler gives up early.
+          static void DOLWalkFrames(uintptr_t pc, uintptr_t lr, uintptr_t fp, uintptr_t sp)
+          {
+            DOLLogf("Frame-pointer backtrace from the faulting context:\n");
+
+            unsigned idx = 0;
+            DOLLogFrame(idx++, (void*)pc);
+            if (lr)
+              DOLLogFrame(idx++, (void*)lr);
+
+            while (fp && idx < 48)
+            {
+              if ((fp & 0xf) != 0 || fp < sp)
+                break;
+
+              uintptr_t frame[2];
+              if (!DOLSafeRead(fp, frame, sizeof(frame)))
+                break;
+              if (!frame[1])
+                break;
+
+              DOLLogFrame(idx++, (void*)frame[1]);
+
+              if (frame[0] <= fp)
+                break;
+              fp = frame[0];
+            }
+          }
+
+          #if defined(__arm64__)
+          static void DOLLogRegisters(void* context, uintptr_t* pc, uintptr_t* lr, uintptr_t* fp, uintptr_t* sp)
+          {
+            ucontext_t* uc = (ucontext_t*)context;
+            if (!uc || !uc->uc_mcontext)
+              return;
+
+            const _STRUCT_ARM_THREAD_STATE64* ts = &uc->uc_mcontext->__ss;
+            *pc = (uintptr_t)__darwin_arm_thread_state64_get_pc(*ts);
+            *lr = (uintptr_t)__darwin_arm_thread_state64_get_lr(*ts);
+            *fp = (uintptr_t)__darwin_arm_thread_state64_get_fp(*ts);
+            *sp = (uintptr_t)__darwin_arm_thread_state64_get_sp(*ts);
+
+            DOLLogf("Registers: pc=0x%lx lr=0x%lx sp=0x%lx fp=0x%lx cpsr=0x%x\n", (unsigned long)*pc, (unsigned long)*lr,
+                    (unsigned long)*sp, (unsigned long)*fp, (unsigned)ts->__cpsr);
+            for (int i = 0; i < 29; i++)
+              DOLLogf("%sx%d=0x%llx%s", (i % 4 == 0) ? "  " : " ", i, (unsigned long long)ts->__x[i],
+                      (i % 4 == 3 || i == 28) ? "\n" : "");
+          }
+          #endif
+
+          static volatile sig_atomic_t s_dol_in_crash = 0;
+
           static void DOLSignalHandler(int sig, siginfo_t* info, void* context)
           {
+            if (s_dol_in_crash)
+            {
+              // The handler itself crashed; fall back to the default action so the process still dies cleanly.
+              signal(sig, SIG_DFL);
+              return;
+            }
+            s_dol_in_crash = 1;
+
             char tname[64] = "";
             pthread_getname_np(pthread_self(), tname, sizeof(tname));
 
-            DOLLogf("\n==== CRASH: signal %d code=%d fault_addr=%p thread=\"%s\" ====\n", sig, info ? info->si_code : 0,
-                    info ? info->si_addr : NULL, tname);
+            time_t now = time(NULL);
+            DOLLogf("\n==== CRASH: %s (signal %d) code=%d fault_addr=%p thread=\"%s\" ====\n", DOLSignalName(sig), sig,
+                    info ? info->si_code : 0, info ? info->si_addr : NULL, tname);
+            DOLLogf("time: %s", ctime(&now));
+            DOLLogf("resident memory: %.1f MB\n", DOLResidentMB());
 
-          (void)context;
+            uintptr_t pc = 0, lr = 0, fp = 0, sp = 0;
+          #if defined(__arm64__)
+            DOLLogRegisters(context, &pc, &lr, &fp, &sp);
+          #else
+            (void)context;
+          #endif
 
-            DOLLogBacktrace("Backtrace of crashing thread:");
+            DOLLogCrashInfoMessages();
+            DOLLogBacktrace("Backtrace of crashing thread (backtrace()):");
+            if (pc)
+              DOLWalkFrames(pc, lr, fp, sp);
             DOLLogf("==== END OF CRASH ====\n");
+
+            fsync(s_dol_log_fd);
 
             // Restore the default action so the system still produces its crash report
             signal(sig, SIG_DFL);
@@ -612,6 +809,37 @@ jobs:
             return 1;
           }
 
+          static dispatch_source_t s_dol_heartbeat = NULL;
+
+          // Logs app state changes, memory warnings and a heartbeat with the resident size, so jetsam kills and
+          // "went to background" cases are distinguishable from real crashes in the log.
+          static void DOLInstallLifecycleLogging(void)
+          {
+            NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
+            NSArray<NSString*>* names = @[
+              UIApplicationDidReceiveMemoryWarningNotification, UIApplicationWillResignActiveNotification,
+              UIApplicationDidBecomeActiveNotification, UIApplicationDidEnterBackgroundNotification,
+              UIApplicationWillEnterForegroundNotification, UIApplicationWillTerminateNotification
+            ];
+            for (NSString* name in names)
+            {
+              [nc addObserverForName:name
+                              object:nil
+                               queue:nil
+                          usingBlock:^(NSNotification* note) {
+                            DOLLogf("[lifecycle] %s (resident %.1f MB)\n", [[note name] UTF8String], DOLResidentMB());
+                          }];
+            }
+
+            s_dol_heartbeat = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+            dispatch_source_set_timer(s_dol_heartbeat, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), 10 * NSEC_PER_SEC,
+                                      NSEC_PER_SEC);
+            dispatch_source_set_event_handler(s_dol_heartbeat, ^{
+              DOLLogf("[heartbeat] resident %.1f MB\n", DOLResidentMB());
+            });
+            dispatch_resume(s_dol_heartbeat);
+          }
+
           static NSUncaughtExceptionHandler* s_dol_previous_exception_handler = NULL;
 
           static void DOLUncaughtExceptionHandler(NSException* exception)
@@ -635,6 +863,9 @@ jobs:
 
           static void DOLInstallDiagnostics(void)
           {
+            // Best effort: ask os_log (used by the Metal runtime for assertion text) to mirror to stderr, like under Xcode.
+            setenv("OS_ACTIVITY_DT_MODE", "YES", 1);
+
             if (!DOLOpenLog())
               return;
 
@@ -648,8 +879,15 @@ jobs:
             {
               const char* name = _dyld_get_image_name(i);
               if (name && strstr(name, ".app/"))
+              {
                 DOLLogf("image %u slide=0x%lx %s\n", i, (unsigned long)_dyld_get_image_vmaddr_slide(i), name);
+                DOLLogImageUUID(i);
+              }
             }
+
+            DOLLogf("build: %s %s\n", __DATE__, __TIME__);
+            DOLLogf("physical memory: %.0f MB, resident now: %.1f MB\n", [[NSProcessInfo processInfo] physicalMemory] / 1048576.0, DOLResidentMB());
+            DOLInstallLifecycleLogging();
 
             s_dol_previous_exception_handler = NSGetUncaughtExceptionHandler();
             NSSetUncaughtExceptionHandler(&DOLUncaughtExceptionHandler);
@@ -706,6 +944,103 @@ jobs:
           else:
               print("WARNING: setTextureType block not found, skipped")
           PYEOF5
+
+      - name: A7 Metal safety flags and Metal diagnostics
+        run: |
+          python3 - <<'PYEOF6'
+          import re
+          base = "Source/Core/VideoBackends/Metal/"
+
+          def load(n):
+              return open(base + n, newline="").read()
+
+          def save(n, s):
+              open(base + n, "w", newline="").write(s)
+
+          def add_include(s, after, inc):
+              if inc in s:
+                  return s
+              assert s.count(after) == 1, after
+              return s.replace(after, after + inc + "\n")
+
+          # ---- MTLUtil.mm: A7 capability flags + feature log ----
+          s = load("MTLUtil.mm")
+          if "A7-SAFE" in s:
+              print("MTLUtil.mm already patched")
+          else:
+              s = add_include(s, "#include <fstream>\n", "#include <cstdio>")
+
+              a1 = "  config->backend_info.bSupportsFramebufferFetch = true;\n#endif\n"
+              assert s.count(a1) == 1, "framebuffer fetch anchor"
+              flags = (
+                  "  config->backend_info.bSupportsFramebufferFetch = true;\n"
+                  "  // A7-SAFE: A7 is GPU family 1 only. Fragment-shader buffer writes / atomics (used by the bounding box)\n"
+                  "  // are unverified there and the Metal runtime aborts the whole process on invalid state, so use the\n"
+                  "  // core's software fallbacks on that GPU.\n"
+                  "  if (![device supportsFeatureSet:MTLFeatureSet_iOS_GPUFamily2_v1])\n"
+                  "  {\n"
+                  "    config->backend_info.bSupportsBBox = false;\n"
+                  "    config->backend_info.bSupportsFragmentStoresAndAtomics = false;\n"
+                  "  }\n"
+                  "#endif\n")
+              s = s.replace(a1, flags)
+
+              a2 = ("  if (DriverDetails::HasBug(DriverDetails::BUG_BROKEN_DYNAMIC_SAMPLER_INDEXING))\n"
+                    "    config->backend_info.bSupportsDynamicSamplerIndexing = false;\n}\n")
+              assert s.count(a2) == 1, "sampler indexing anchor"
+              log = (
+                  "  if (DriverDetails::HasBug(DriverDetails::BUG_BROKEN_DYNAMIC_SAMPLER_INDEXING))\n"
+                  "    config->backend_info.bSupportsDynamicSamplerIndexing = false;\n"
+                  "#if !TARGET_OS_OSX\n"
+                  "  // stderr is captured into DolphiniOS-debug.log by the diagnostics code in main.m\n"
+                  "  fprintf(stderr,\n"
+                  "          \"[metal] device=\\\"%s\\\" iOS=%d.%d family1=%d family2=%d family3=%d family4=%d\\n\"\n"
+                  "          \"[metal] dualsrc=%d bbox=%d fragstores=%d fbfetch=%d depthclamp=%d compute=%d gputexdecode=%d\\n\",\n"
+                  "          [[device name] UTF8String], (int)cocoa_ver.majorVersion, (int)cocoa_ver.minorVersion,\n"
+                  "          (int)[device supportsFeatureSet:MTLFeatureSet_iOS_GPUFamily1_v1],\n"
+                  "          (int)[device supportsFeatureSet:MTLFeatureSet_iOS_GPUFamily2_v1],\n"
+                  "          (int)[device supportsFeatureSet:MTLFeatureSet_iOS_GPUFamily3_v1],\n"
+                  "          (int)[device supportsFeatureSet:MTLFeatureSet_iOS_GPUFamily4_v1],\n"
+                  "          (int)config->backend_info.bSupportsDualSourceBlend, (int)config->backend_info.bSupportsBBox,\n"
+                  "          (int)config->backend_info.bSupportsFragmentStoresAndAtomics,\n"
+                  "          (int)config->backend_info.bSupportsFramebufferFetch, (int)config->backend_info.bSupportsDepthClamp,\n"
+                  "          (int)config->backend_info.bSupportsComputeShaders,\n"
+                  "          (int)config->backend_info.bSupportsGPUTextureDecoding);\n"
+                  "#endif\n"
+                  "}\n")
+              s = s.replace(a2, log)
+              save("MTLUtil.mm", s)
+              print("MTLUtil.mm patched")
+
+          # ---- MTLObjectCache.mm: log pipeline compile failures to the debug log before the (blocking) alert ----
+          s = load("MTLObjectCache.mm")
+          if "[metal] render pipeline" in s:
+              print("MTLObjectCache.mm already patched")
+          else:
+              a = '        PanicAlertFmt("Failed to compile pipeline for {} and {}: {}",\n'
+              assert s.count(a) == 1, "pipeline alert anchor"
+              ins = ('        fprintf(stderr, "[metal] render pipeline compile failed: vs=%s fs=%s: %s\\n",\n'
+                     '                [[[desc vertexFunction] label] UTF8String], [[[desc fragmentFunction] label] UTF8String],\n'
+                     '                [[err localizedDescription] UTF8String]);\n')
+              s = s.replace(a, ins + a)
+              s = add_include(s, '#include "VideoBackends/Metal/MTLObjectCache.h"\n', "\n#include <cstdio>")
+              save("MTLObjectCache.mm", s)
+              print("MTLObjectCache.mm patched")
+
+          # ---- MTLGfx.mm: same for compute pipelines ----
+          s = load("MTLGfx.mm")
+          if "[metal] compute pipeline" in s:
+              print("MTLGfx.mm already patched")
+          else:
+              a = '        DumpBadShader(fmt::format("Failed to compile compute pipeline {}", name));\n'
+              assert s.count(a) == 1, "compute pipeline anchor"
+              ins = ('        fprintf(stderr, "[metal] compute pipeline compile failed (%s): %s\\n", std::string(name).c_str(),\n'
+                     '                [[err localizedDescription] UTF8String]);\n')
+              s = s.replace(a, ins + a)
+              s = add_include(s, '#include "VideoBackends/Metal/MTLGfx.h"\n', "\n#include <cstdio>")
+              save("MTLGfx.mm", s)
+              print("MTLGfx.mm patched")
+          PYEOF6
 
       - name: Build (Jailbroken, iOS 10, arm64)
         run: |
