@@ -1042,6 +1042,118 @@ jobs:
               print("MTLGfx.mm patched")
           PYEOF6
 
+      - name: SPIRV-Cross - keep the error text in Release builds
+        run: |
+          python3 - <<'PYEOF7'
+          import re
+          f = "Externals/spirv_cross/SPIRV-Cross/spirv_cross_error_handling.hpp"
+          s = open(f, newline="").read()
+          if "DOL-SPVX" in s:
+              print("already patched")
+          else:
+              # Release (NDEBUG) drops the message and just abort()s, so the crash log has no cause. Always print it.
+              pat = re.compile(r"(report_and_abort\s*\(\s*const\s+std::string\s*&\s*msg\s*\)\s*\{)(.*?)(\n\s*abort\(\);)", re.S)
+              assert len(pat.findall(s)) == 1, "report_and_abort not found"
+              printer = '\n  /* DOL-SPVX */ fprintf(stderr, "[spirv-cross] FATAL: %s\\n", msg.c_str());\n  fflush(stderr);'
+              s = pat.sub(lambda m: m.group(1) + printer + m.group(3), s)
+              if "<cstdio>" not in s and "<stdio.h>" not in s:
+                  s = s.replace("#include <stdlib.h>", "#include <stdlib.h>\n#include <stdio.h>", 1)
+              open(f, "w", newline="").write(s)
+              print("spirv_cross_error_handling.hpp patched")
+          PYEOF7
+
+      - name: iOS 10 - MSL 1.2 and no MSL 2.0-only features
+        run: |
+          python3 - <<'PYEOF8'
+          f = "Source/Core/VideoBackends/Metal/MTLUtil.mm"
+          s = open(f, newline="").read()
+          if "DOL-MSL12" in s:
+              print("already patched")
+          else:
+              # iOS 10 only has MSL 1.2; asking SPIRV-Cross for 2.0 produces code the device cannot compile (and can abort inside SPIRV-Cross)
+              a = "  else\n    options.set_msl_version(2, 0);\n"
+              assert s.count(a) == 1, "msl version anchor"
+              s = s.replace(a, "  else if (@available(macOS 10.13, iOS 11, *))\n    options.set_msl_version(2, 0);\n"
+                               "  else\n    options.set_msl_version(1, 2);  // DOL-MSL12\n")
+              # compute texture decoding, dynamic vertex loader and VS line/point expand need 8/16-bit storage + MSL 2.0
+              b = "  if (DriverDetails::HasBug(DriverDetails::BUG_BROKEN_DYNAMIC_SAMPLER_INDEXING))\n    config->backend_info.bSupportsDynamicSamplerIndexing = false;\n"
+              assert s.count(b) == 1, "sampler indexing anchor"
+              flags = ("#if !TARGET_OS_OSX\n"
+                       "  if (@available(iOS 11, *))\n  {\n  }\n  else\n  {\n"
+                       "    config->backend_info.bSupportsGPUTextureDecoding = false;\n"
+                       "    config->backend_info.bSupportsDynamicVertexLoader = false;\n"
+                       "    config->backend_info.bSupportsVSLinePointExpand = false;\n"
+                       "  }\n#endif\n")
+              s = s.replace(b, flags + b)
+              open(f, "w", newline="").write(s)
+              print("MTLUtil.mm patched for iOS 10")
+          PYEOF8
+
+      - name: A7 - no base-vertex draws, no multisample array textures
+        run: |
+          python3 - <<'PYEOF9'
+          m = "Source/Core/VideoBackends/Metal/"
+          def patch(name, pairs):
+              s = open(m + name, newline="").read()
+              if "DOL-BASEV" in s:
+                  print(name, "already patched")
+                  return
+              for old, new in pairs:
+                  assert s.count(old) == 1, (name, old, s.count(old))
+                  s = s.replace(old, new)
+              open(m + name, "w", newline="").write(s)
+              print(name, "patched")
+
+          # Pipeline remembers its vertex stride so a draw can emulate baseVertex with a buffer offset
+          patch("MTLPipeline.h", [
+              ("  AbstractPipelineUsage Usage() const { return m_usage; }\n",
+               "  AbstractPipelineUsage Usage() const { return m_usage; }\n  u32 VertexStride() const { return m_vertex_stride; }  // DOL-BASEV\n"),
+              ("  AbstractPipelineUsage m_usage;\n  PipelineReflection m_reflection;\n",
+               "  AbstractPipelineUsage m_usage;\n  PipelineReflection m_reflection;\n  u32 m_vertex_stride = 0;\n"),
+          ])
+          patch("MTLPipeline.mm", [
+              ("      m_depth_stencil(depth), m_usage(usage), m_reflection(reflection)\n{\n}\n",
+               "      m_depth_stencil(depth), m_usage(usage), m_reflection(reflection)\n{\n"
+               "  // DOL-BASEV\n  m_vertex_stride = config.vertex_format ? config.vertex_format->GetVertexStride() : 0;\n}\n"),
+              ('#include "Common/MsgHandler.h"\n', '#include "Common/MsgHandler.h"\n#include "VideoCommon/NativeVertexFormat.h"\n'),
+          ])
+          # baseVertex/baseInstance draws need GPU family 3 (A9+); on A7/A8 Metal asserts. Emulate with the vertex buffer offset.
+          patch("MTLStateTracker.mm", [
+              ("void Metal::StateTracker::Draw(u32 base_vertex, u32 num_vertices)\n",
+               "static bool DOLSupportsBaseVertex()  // DOL-BASEV\n{\n#if TARGET_OS_OSX\n  return true;\n#else\n"
+               "  static const bool supported = [g_device supportsFeatureSet:MTLFeatureSet_iOS_GPUFamily3_v1];\n  return supported;\n#endif\n}\n\n"
+               "void Metal::StateTracker::Draw(u32 base_vertex, u32 num_vertices)\n"),
+              ("  PrepareRender();\n  [m_current_render_encoder drawPrimitives:m_state.render_pipeline->Prim()\n",
+               "  PrepareRender();\n  if (!DOLSupportsBaseVertex() && m_state.vertices && m_state.render_pipeline->UsesVertexBuffer(0))\n"
+               "    SetVertexBufferNow(0, m_state.vertices, 0);\n"
+               "  [m_current_render_encoder drawPrimitives:m_state.render_pipeline->Prim()\n"),
+              ("  PrepareRender();\n  [m_current_render_encoder drawIndexedPrimitives:m_state.render_pipeline->Prim()\n",
+               "  PrepareRender();\n  if (!DOLSupportsBaseVertex())\n  {\n"
+               "    if (m_state.vertices && m_state.render_pipeline->UsesVertexBuffer(0))\n"
+               "      SetVertexBufferNow(0, m_state.vertices, base_vertex * m_state.render_pipeline->VertexStride());\n"
+               "    [m_current_render_encoder drawIndexedPrimitives:m_state.render_pipeline->Prim()\n"
+               "                                         indexCount:num_indices\n"
+               "                                          indexType:MTLIndexTypeUInt16\n"
+               "                                        indexBuffer:m_state.indices\n"
+               "                                  indexBufferOffset:base_index * sizeof(u16)\n"
+               "                                      instanceCount:1];\n"
+               "    return;\n  }\n"
+               "  [m_current_render_encoder drawIndexedPrimitives:m_state.render_pipeline->Prim()\n"),
+          ])
+          # MTLTextureType2DMultisampleArray is iOS 14+; without it only 1x is usable. Also the dynamic vertex loader relies on base vertex.
+          patch("MTLUtil.mm", [
+              ("  config->backend_info.AAModes.clear();\n",
+               "  config->backend_info.AAModes.clear();\n  bool msaa_array_ok = false;  // DOL-BASEV\n"
+               "  if (@available(macOS 10.14, iOS 14, *))\n    msaa_array_ok = true;\n"),
+              ("    if ([device supportsTextureSampleCount:i])\n      config->backend_info.AAModes.push_back(i);\n",
+               "    if ((i == 1 || msaa_array_ok) && [device supportsTextureSampleCount:i])\n      config->backend_info.AAModes.push_back(i);\n"),
+              ("  if (DriverDetails::HasBug(DriverDetails::BUG_BROKEN_DYNAMIC_SAMPLER_INDEXING))\n    config->backend_info.bSupportsDynamicSamplerIndexing = false;\n",
+               "#if !TARGET_OS_OSX\n  if (![device supportsFeatureSet:MTLFeatureSet_iOS_GPUFamily3_v1])\n"
+               "    config->backend_info.bSupportsDynamicVertexLoader = false;\n#endif\n"
+               "  if (DriverDetails::HasBug(DriverDetails::BUG_BROKEN_DYNAMIC_SAMPLER_INDEXING))\n    config->backend_info.bSupportsDynamicSamplerIndexing = false;\n"),
+          ])
+          PYEOF9
+
       - name: Build (Jailbroken, iOS 10, arm64)
         run: |
           set -o pipefail
