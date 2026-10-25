@@ -1254,6 +1254,40 @@ jobs:
               print("MTLUtil.mm dual-source blend disabled for iOS 10")
           PYEOF12
 
+      - name: Fix Wii input crash (missing SWING axes in StateManager)
+        run: |
+          python3 - <<'PYEOF13'
+          f = "Source/Core/InputCommon/ControllerInterface/iOS/StateManager.cpp"
+          s = open(f, newline="").read()
+          if "DOL-SAFEAT" in s:
+              print("already patched")
+          else:
+              pairs = [
+                  ("    state.PopulateAxis(ButtonType::WIIMOTE_SWING_RIGHT);\n",
+                   "    state.PopulateAxis(ButtonType::WIIMOTE_SWING_RIGHT);\n"
+                   "    state.PopulateAxis(ButtonType::WIIMOTE_SWING_FORWARD);\n"
+                   "    state.PopulateAxis(ButtonType::WIIMOTE_SWING_BACKWARD);\n"),
+                  ("  return m_controllers[controller_id].m_buttons.at(button);\n",
+                   "  // DOL-SAFEAT: .at() throws out_of_range -> abort() with exceptions disabled\n"
+                   "  if (controller_id < 0 || static_cast<size_t>(controller_id) >= m_controllers.size())\n"
+                   "    return false;\n"
+                   "  const auto& buttons = m_controllers[controller_id].m_buttons;\n"
+                   "  const auto it = buttons.find(button);\n"
+                   "  return it != buttons.end() && it->second;\n"),
+                  ("  return m_controllers[controller_id].m_axes.at(axis);\n",
+                   "  if (controller_id < 0 || static_cast<size_t>(controller_id) >= m_controllers.size())\n"
+                   "    return 0.0f;\n"
+                   "  const auto& axes = m_controllers[controller_id].m_axes;\n"
+                   "  const auto it = axes.find(axis);\n"
+                   "  return it != axes.end() ? it->second : 0.0f;\n"),
+              ]
+              for old, new in pairs:
+                  assert s.count(old) == 1, (old, s.count(old))
+                  s = s.replace(old, new)
+              open(f, "w", newline="").write(s)
+              print("StateManager.cpp patched")
+          PYEOF13
+
       - name: Build (Jailbroken, iOS 10, arm64)
         run: |
           set -o pipefail
