@@ -1237,6 +1237,23 @@ jobs:
               print("MTLUtil.mm palette/SSAA flags patched")
           PYEOF11
 
+      - name: iOS 10 - no dual-source blending
+        run: |
+          python3 - <<'PYEOF12'
+          f = "Source/Core/VideoBackends/Metal/MTLUtil.mm"
+          s = open(f, newline="").read()
+          if "DOL-NODUAL" in s:
+              print("already patched")
+          else:
+              a = "    config->backend_info.bSupportsVSLinePointExpand = false;\n"
+              assert s.count(a) == 1, "VSLinePointExpand anchor"
+              s = s.replace(a, a +
+                  "    // MSL 1.2 / iOS 10 has no [[color(n), index(m)]] (dual-source blending), every pixel shader failed to compile\n"
+                  "    config->backend_info.bSupportsDualSourceBlend = false;  // DOL-NODUAL\n")
+              open(f, "w", newline="").write(s)
+              print("MTLUtil.mm dual-source blend disabled for iOS 10")
+          PYEOF12
+
       - name: Build (Jailbroken, iOS 10, arm64)
         run: |
           set -o pipefail
