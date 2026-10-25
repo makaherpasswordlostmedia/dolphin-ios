@@ -1150,6 +1150,93 @@ jobs:
           ])
           PYEOF9
 
+      - name: iOS 10 - no arrays of samplers (MSL 1.2)
+        run: |
+          python3 - <<'PYEOF10'
+          import re
+          core = "Source/Core/"
+
+          def patch(path, pairs, marker):
+              s = open(core + path, newline="").read()
+              if marker in s:
+                  print(path, "already patched")
+                  return
+              for old, new in pairs:
+                  assert s.count(old) == 1, (path, old, s.count(old))
+                  s = s.replace(old, new)
+              open(core + path, "w", newline="").write(s)
+              print(path, "patched")
+
+          SPLIT = "(api_type == APIType::Metal && !host_config.backend_dynamic_sampler_indexing)"
+
+          # MSL 1.2 (iOS 10) has no arrays of samplers, SPIRV-Cross aborts. Use samp0..samp7 instead of samp[8].
+          patch("VideoCommon/PixelShaderGen.cpp", [
+              ('  out.Write("SAMPLER_BINDING(0) uniform sampler2DArray samp[8];\\n");\n',
+               '  // DOL-SAMPSPLIT\n'
+               '  if ' + SPLIT + '\n'
+               '  {\n'
+               '    for (int i = 0; i < 8; i++)\n'
+               '      out.Write("SAMPLER_BINDING({0}) uniform sampler2DArray samp{0};\\n", i);\n'
+               '  }\n'
+               '  else\n'
+               '  {\n'
+               '    out.Write("SAMPLER_BINDING(0) uniform sampler2DArray samp[8];\\n");\n'
+               '  }\n'),
+              ('  out.Write("\\n#define sampleTextureWrapper(texmap, uv, layer) "\n'
+               '            "sampleTexture(texmap, samp[texmap], uv, layer)\\n");\n',
+               '  if ' + SPLIT + '\n'
+               '  {\n'
+               '    out.Write("\\nint4 sampleTextureWrapper(uint sampler_num, int2 uv, int layer) {{\\n"\n'
+               '              "  switch(sampler_num) {{\\n");\n'
+               '    for (int i = 0; i < 8; i++)\n'
+               '      out.Write("  case {0}u: return sampleTexture({0}u, samp{0}, uv, layer);\\n", i);\n'
+               '    out.Write("  }}\\n"\n'
+               '              "  return int4(0, 0, 0, 0);\\n"\n'
+               '              "}}\\n");\n'
+               '  }\n'
+               '  else\n'
+               '  {\n'
+               '    out.Write("\\n#define sampleTextureWrapper(texmap, uv, layer) "\n'
+               '              "sampleTexture(texmap, samp[texmap], uv, layer)\\n");\n'
+               '  }\n'),
+          ], "DOL-SAMPSPLIT")
+
+          patch("VideoCommon/UberShaderPixel.cpp", [
+              ('      out.Write("  case {0}u: return sampleTexture({0}u, samp[{0}u], uv, layer);\\n", i);\n',
+               '      // DOL-SAMPSPLIT\n'
+               '      if ' + SPLIT + '\n'
+               '        out.Write("  case {0}u: return sampleTexture({0}u, samp{0}, uv, layer);\\n", i);\n'
+               '      else\n'
+               '        out.Write("  case {0}u: return sampleTexture({0}u, samp[{0}u], uv, layer);\\n", i);\n'),
+          ], "DOL-SAMPSPLIT")
+
+          # Metal on iOS < 11 (MSL 1.2): no dynamic sampler indexing
+          patch("VideoBackends/Metal/MTLUtil.mm", [
+              ("    config->backend_info.bSupportsGPUTextureDecoding = false;\n",
+               "    config->backend_info.bSupportsGPUTextureDecoding = false;\n"
+               "    config->backend_info.bSupportsDynamicSamplerIndexing = false;  // DOL-SAMPSPLIT\n"),
+          ], "DOL-SAMPSPLIT")
+          PYEOF10
+
+      - name: iOS 10 - no palette conversion / SSAA
+        run: |
+          python3 - <<'PYEOF11'
+          f = "Source/Core/VideoBackends/Metal/MTLUtil.mm"
+          s = open(f, newline="").read()
+          if "DOL-NOTEXEL" in s:
+              print("already patched")
+          else:
+              a = "    config->backend_info.bSupportsVSLinePointExpand = false;\n"
+              assert s.count(a) == 1, "VSLinePointExpand anchor"
+              s = s.replace(a, a +
+                  "    // Palette conversion reads a texel buffer (needs MSL 2.1 on iOS); fall back to CPU palette decoding\n"
+                  "    config->backend_info.bSupportsPaletteConversion = false;  // DOL-NOTEXEL\n"
+                  "    // SSAA needs per-sample shading (gl_SampleID), only reachable with MSAA which is off before iOS 14\n"
+                  "    config->backend_info.bSupportsSSAA = false;\n")
+              open(f, "w", newline="").write(s)
+              print("MTLUtil.mm palette/SSAA flags patched")
+          PYEOF11
+
       - name: Build (Jailbroken, iOS 10, arm64)
         run: |
           set -o pipefail
